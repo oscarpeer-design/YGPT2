@@ -1,0 +1,368 @@
+# This file builds context which is sent to LLM queries
+
+# Import external dependencies
+# dataclass, replace: used to make struct-like classes and to make edited copies of them
+from dataclasses import dataclass, replace
+# Path: library used to find file paths on computer
+from pathlib import Path
+
+# Import internal dependencies
+from code_chunker import CodeChunk, RepositoryData, RelationshipType
+from code_chunk_utils import get_chunk_text
+from config import *
+
+# --- Reviewing a file one chunk at a time ---
+# The small model cannot read a whole file at once, so each chunk is reviewed in its own small prompt.
+# Everything that decides what goes into those prompts (and which chunks are reviewed first) is in this file.
+
+# ReviewHint: a line that looks suspicious, shown to the model so that it checks that line instead of searching on its own
+@dataclass
+class ReviewHint:
+    line: int # real line number in the source file
+    text: str # the line of code (shortened for display)
+    description: str # why the line looks suspicious
+    points: int # how strong the signal is (used to rank reviews and to pick the strongest hints)
+
+# ContextLine: a line from elsewhere in a function that uses the same names as a flagged line (where a value comes from, or a check on it)
+@dataclass
+class ContextLine:
+    line: int # real line number in the source file
+    text: str # the line of code (shortened for display)
+
+# Get the instruction for a kind of review
+def get_review_instruction(kind: str) -> str:
+    # performance reviews have their own instruction; everything else is a security review
+    if kind == REVIEW_KIND_PERFORMANCE:
+        return CODE_REVIEW_PERFORMANCE_CHUNK_INSTRUCTION
+    return CODE_REVIEW_SECURITY_CHUNK_INSTRUCTION
+
+# How many characters a review prompt may use so that the prompt AND the model's answer both fit in the context window
+def get_prompt_char_budget() -> int:
+    # the prompt and the answer must both fit in the context window
+    tokens_available = MODEL_CTX - REVIEW_N_PREDICT
+    # we also cap the prompt so that each review stays quick
+    tokens_for_prompt = min(tokens_available, REVIEW_MAX_PROMPT_TOKENS)
+    # turn tokens into characters (an estimate), keeping some room to spare
+    return int(tokens_for_prompt * CHARS_PER_TOKEN * PROMPT_SAFETY_FACTOR)
+
+# Windows line endings (\r\n) only waste space in a prompt
+def normalise_line_endings(text: str) -> str:
+    # replace each \r\n with \n
+    return text.replace("\r\n", "\n")
+
+# Show a chunk's source with its real line numbers at the left, so the model can say which line a problem is on (the code itself is unchanged)
+def number_source_lines(chunk: CodeChunk) -> str:
+    # split the code into lines
+    lines = normalise_line_endings(chunk.source).split("\n")
+    # work out how wide the largest line number is so that the numbers line up
+    width = len(str(chunk.start_line + len(lines) - 1))
+    # put each line's real line number in front of it
+    numbered_lines = []
+    for offset, line in enumerate(lines):
+        numbered_lines.append(f"{chunk.start_line + offset:>{width}} | {line}")
+    # join the lines back together
+    return "\n".join(numbered_lines)
+
+# Describe where a chunk is in words, e.g. "function 'parse', lines 10-42"
+def describe_chunk_location(chunk: CodeChunk) -> str:
+    return f"{chunk.symbol_type.value} '{chunk.chunk_name}', lines {chunk.start_line}-{chunk.end_line}"
+
+# Show a chunk as background code
+def format_related_chunk(chunk: CodeChunk, target: CodeChunk) -> str:
+    # a heading saying what the code is (and which file it is in, if that is not the file under review), then the code
+    where = describe_chunk_location(chunk) if chunk.file_path == target.file_path else f"{describe_chunk_location(chunk)} of {Path(chunk.file_path).name}"
+    return f"[{where}]\n{normalise_line_endings(chunk.source)}"
+
+# Build the heading that goes above the code under review
+def build_review_header(target: CodeChunk, enclosing: CodeChunk | None) -> str:
+    # say which file the code is in and where
+    header = f"CODE UNDER REVIEW ({describe_chunk_location(target)} of {Path(target.file_path).name})"
+    # say what contains the code, if something does
+    if enclosing is not None:
+        header += f"\nIt is defined inside {enclosing.symbol_type.value} '{enclosing.chunk_name}'."
+    return header
+
+# Show the flagged lines by number and reason. The code of each line is already shown with its number, and repeating it would only tempt the model to copy it.
+def format_review_hints(hints: list[ReviewHint]) -> str:
+    heading = "\nFLAGGED LINES (from a simple pattern search, they may be false alarms):\n"
+    hint_lines = []
+    for hint in hints:
+        hint_lines.append(f"line {hint.line}: {hint.description}")
+    return heading + "\n".join(hint_lines) + "\n"
+
+# Show lines from elsewhere in the function that use the same names as a flagged line
+def format_context_lines(context_lines: list[ContextLine]) -> str:
+    heading = "\nOTHER LINES THAT USE THE SAME NAMES (from elsewhere in the function):\n"
+    shown_lines = []
+    for context in context_lines:
+        shown_lines.append(f"line {context.line}: {context.text}")
+    return heading + "\n".join(shown_lines) + "\n"
+
+# Build the prompt for reviewing ONE chunk, adding lines that use the same names and related chunks as background for as long as they fit.
+# Returns (prompt, the related chunks that were included), or None if the code and the flagged lines do not fit in the prompt.
+def build_chunk_review_prompt(
+    target: CodeChunk,
+    related_candidates: list[CodeChunk],
+    enclosing: CodeChunk | None,
+    kind: str = REVIEW_KIND_SECURITY,
+    hints: list[ReviewHint] | None = None,
+    context_lines: list[ContextLine] | None = None
+) -> tuple[str, list[CodeChunk]] | None:
+    # find how much room the prompt has
+    char_budget = get_prompt_char_budget()
+    # start with the instruction, then the code under review
+    prompt = (
+        f"{get_review_instruction(kind)}\n"
+        f"{build_review_header(target, enclosing)}\n"
+        f"{number_source_lines(target)}\n"
+    )
+    # if the chunk alone is too large it can not be reviewed in one prompt
+    if len(prompt) > char_budget:
+        return None
+    # add the flagged lines: the model is asked about them, so the review can not be done without them
+    if hints:
+        prompt += format_review_hints(hints)
+        if len(prompt) > char_budget:
+            return None
+    # add the lines that use the same names, if they fit (they help, but the code and the flagged lines matter more)
+    if context_lines:
+        context_block = format_context_lines(context_lines)
+        if len(prompt) + len(context_block) <= char_budget:
+            prompt += context_block
+    # add related chunks (best match first) until we have enough of them or run out of room
+    related_heading = "\nRELATED CODE (background only, do not review):\n"
+    included: list[CodeChunk] = []
+    for candidate in related_candidates:
+        # stop when we have enough related chunks
+        if len(included) >= REVIEW_RELATED_CHUNK_COUNT:
+            break
+        # work out how much room this chunk would take (the first one also needs the heading)
+        block = format_related_chunk(candidate, target) + "\n\n"
+        extra = len(block)
+        if not included:
+            extra += len(related_heading)
+        # chunks are added whole or not at all: source code is never cut short
+        if len(prompt) + extra > char_budget:
+            continue
+        # add the heading before the first related chunk
+        if not included:
+            prompt += related_heading
+        prompt += block
+        included.append(candidate)
+    # remove trailing blank lines
+    return prompt.rstrip() + "\n", included
+
+# Cut the part of a chunk around some of its lines (the flagged lines) into windows. Each window holds REVIEW_FOCUS_RADIUS_LINES lines above and below a flagged line,
+# and windows that touch are joined while they stay within REVIEW_FOCUS_MAX_LINES. Each window keeps its real line numbers.
+# The chunk itself is not changed: each window is a copy.
+def get_focus_windows(chunk: CodeChunk, focus_lines: list[int]) -> list[CodeChunk]:
+    # split the code into lines, and find the real line number of the last one
+    lines = normalise_line_endings(chunk.source).split("\n")
+    last_line = chunk.start_line + len(lines) - 1
+    # work out the first and last line of each window
+    ranges: list[list[int]] = []
+    for focus_line in sorted(set(focus_lines)):
+        first = max(chunk.start_line, focus_line - REVIEW_FOCUS_RADIUS_LINES)
+        last = min(last_line, focus_line + REVIEW_FOCUS_RADIUS_LINES)
+        # join this window to the one before it if they touch and the joined window is not too long
+        if ranges and first <= ranges[-1][1] + 1 and last - ranges[-1][0] + 1 <= REVIEW_FOCUS_MAX_LINES:
+            ranges[-1][1] = max(ranges[-1][1], last)
+        else:
+            ranges.append([first, last])
+    # build a copy of the chunk for each window
+    windows = []
+    for first, last in ranges:
+        windows.append(replace(
+            chunk,
+            source="\n".join(lines[first - chunk.start_line:last - chunk.start_line + 1]),
+            start_line=first,
+            end_line=last
+        ))
+    return windows
+
+# Build the grammar that forces the model's answer into the shape the review asks for: either NO_ISSUES_TEXT, or up to REVIEW_MAX_FINDINGS_PER_REVIEW findings,
+# each naming one of the flagged lines with a reason and a fix of limited length. Naming only flagged lines means the model can not blame code that was not flagged.
+def build_review_grammar(hints: list[ReviewHint]) -> str:
+    # the line numbers the model may name
+    flagged_lines = set()
+    for hint in hints:
+        flagged_lines.add(hint.line)
+    choices = []
+    for line in sorted(flagged_lines):
+        choices.append(f'"{line}"')
+    line_choices = " | ".join(choices)
+    # a finding, then up to the allowed number of further findings, nested so that each one needs the one before it
+    findings = "finding" + " (finding" * (REVIEW_MAX_FINDINGS_PER_REVIEW - 1) + ")?" * (REVIEW_MAX_FINDINGS_PER_REVIEW - 1)
+    # a reason or a fix is one line of limited length
+    field = "[^\\n]{1," + str(REVIEW_FIELD_MAX_CHARS) + "}"
+    return (
+        f"root ::= none | {findings}\n"
+        f'none ::= "{NO_ISSUES_TEXT}"\n'
+        f'finding ::= "LINE: " line "\\nWHY: " field "\\nFIX: " field "\\n"\n'
+        f"line ::= {line_choices}\n"
+        f"field ::= {field}\n"
+    )
+
+# Get the ids of the chunks that have other chunks inside them
+def get_container_ids(repository_data: RepositoryData) -> set[int]:
+    container_ids = set()
+    # a chunk is a container if it is the start of a CONTAINS relationship
+    for relationship in repository_data.relationships:
+        if relationship.relationship_type == RelationshipType.CONTAINS:
+            container_ids.add(relationship.start_chunk_id)
+    return container_ids
+
+# Get the chunk that contains each chunk, as {chunk id: containing chunk}. (Chunk ids are not positions in the list of chunks, so chunks are looked up by id.)
+def get_parent_chunks(repository_data: RepositoryData) -> dict[int, CodeChunk]:
+    # look chunks up by id
+    chunks_by_id = {}
+    for chunk in repository_data.chunks:
+        chunks_by_id[chunk.chunk_id] = chunk
+    parents = {}
+    # each CONTAINS relationship says which chunk is inside which
+    for relationship in repository_data.relationships:
+        if relationship.relationship_type == RelationshipType.CONTAINS and relationship.start_chunk_id in chunks_by_id:
+            parents[relationship.end_chunk_id] = chunks_by_id[relationship.start_chunk_id]
+    return parents
+
+# Say why a run stopped early: each reason once, with the number of files it affected when it affected more than one
+def describe_stop_reasons(stop_reasons: list[str]) -> str:
+    said = []
+    for reason in sorted(set(stop_reasons)):
+        file_count = stop_reasons.count(reason)
+        if file_count == 1:
+            said.append(reason)
+        else:
+            said.append(f"{reason} ({file_count} files)")
+    return "; ".join(said)
+
+# Describe a number of seconds in plain words (e.g. "5 minute" or "90 second")
+def describe_duration(seconds: float) -> str:
+    # from two minutes up, minutes are easier to read
+    if seconds >= DURATION_MINUTES_FROM_SECONDS:
+        return f"{seconds / SECONDS_PER_MINUTE:.0f} minutes"
+    return f"{seconds:.0f} seconds"
+
+# How many tokens an answer of this many characters needs (a token is about CHARS_PER_TOKEN characters, plus some room to spare)
+def get_answer_tokens(answer_chars: int) -> int:
+    return answer_chars // CHARS_PER_TOKEN + DOCUMENT_ANSWER_SLACK_TOKENS
+
+# How many characters a documentation prompt may use so that the prompt AND the model's answer both fit in the context window.
+# answer_chars is the longest answer the model may write (about 3 characters to a token).
+def get_document_prompt_char_budget(answer_chars: int) -> int:
+    tokens_for_answer = get_answer_tokens(answer_chars)
+    tokens_available = MODEL_CTX - tokens_for_answer
+    tokens_for_prompt = min(tokens_available, DOCUMENT_MAX_PROMPT_TOKENS)
+    return int(tokens_for_prompt * CHARS_PER_TOKEN * PROMPT_SAFETY_FACTOR)
+
+# Cut code to at most max_chars, at the end of a line
+def fit_code_excerpt(code: str, max_chars: int) -> str:
+    code = normalise_line_endings(code).strip("\n")
+    if len(code) <= max_chars:
+        return code
+    # cut at the last line end that fits
+    cut = code.rfind("\n", 0, max_chars)
+    return code[:cut if cut > 0 else max_chars]
+
+# How many characters a chat prompt may use so that the prompt AND the model's answer both fit in the context window
+def get_chat_prompt_char_budget() -> int:
+    tokens_available = MODEL_CTX - CHAT_MAX_ANSWER_TOKENS
+    tokens_for_prompt = min(tokens_available, CHAT_MAX_PROMPT_TOKENS)
+    return int(tokens_for_prompt * CHARS_PER_TOKEN * PROMPT_SAFETY_FACTOR)
+
+# Build the prompt for a chat question: the instruction, then the best matching chunks that fit (most similar first), then the question.
+# Returns the prompt and how many of the chunks it holds (the first that many). With no chunks the prompt has no code and uses the instruction for that case.
+def build_chat_prompt(question: str, chunks: list[CodeChunk]) -> tuple[str, int]:
+    # a very long question is cut, so that it can not take all the room
+    question = question.strip()[:CHAT_MAX_QUESTION_CHARS]
+    question_text = f"QUESTION: {question}\n"
+    if not chunks:
+        return f"{CHAT_NO_CODE_INSTRUCTION}\n\n{question_text}", 0
+    prompt_start = f"{CHAT_INSTRUCTION}\n\nCODE:\n"
+    # the room left for code once the instruction and the question have theirs
+    room = get_chat_prompt_char_budget() - len(prompt_start) - len(question_text) - 1
+    # each chunk may use only its share of the room (one chunk alone may use all of it)
+    share = room // max(1, min(len(chunks), CHAT_CHUNKS_PER_PROMPT))
+    code_text = ""
+    used_count = 0
+    for chunk in chunks:
+        # a heading says where the code is
+        heading = f"[{describe_chunk_location(chunk)} of {Path(chunk.file_path).name}]\n"
+        # the room that is left, and the room this chunk's share allows (the smaller of the two)
+        room_left = room - len(code_text) - len(heading) - 2
+        room_for_code = min(room_left, share - len(heading) - 2)
+        # the code is shortened to the room that is left, and a chunk with no room at all ends the list
+        code = fit_code_excerpt(chunk.source, room_for_code) if room_for_code > 0 else ""
+        if not code:
+            break
+        code_text += heading + code + "\n\n"
+        used_count += 1
+    return prompt_start + code_text + question_text, used_count
+
+# List where the code behind a chat answer came from (written by code, not by the model, so it can be checked). Each source shows how similar it was to the question.
+def describe_chat_sources(chunks: list[CodeChunk], scores: list[float]) -> str:
+    lines = ["Sources:"]
+    for index, chunk in enumerate(chunks):
+        lines.append(f"- {Path(chunk.file_path).name}, lines {chunk.start_line}-{chunk.end_line}: {chunk.chunk_name} (similarity {scores[index]:.2f})")
+    return "\n".join(lines)
+
+# Build the prompt that asks what a file is for and how it works. described are (name, what it does) for the functions that were already described; types are the classes, structs and enums it defines; names are everything it defines.
+def build_file_overview_prompt(file_name: str, language: str, line_count: int, described: list[tuple[str, str]], types: list[str], names: list[str]) -> str:
+    budget = get_document_prompt_char_budget(DOCUMENT_OVERVIEW_MAX_CHARS)
+    prompt = f"{DOCUMENT_OVERVIEW_INSTRUCTION}\nFILE: {file_name} ({language}, {line_count} lines)\n"
+    # what the main functions do comes first because it says the most
+    if described:
+        prompt += "\nWHAT ITS MAIN FUNCTIONS DO:\n"
+        for name, text in described:
+            line = f"- {name}: {text}\n"
+            if len(prompt) + len(line) > budget:
+                break
+            prompt += line
+    # the types come before the other names, because what a class is for is what a file with a class is about
+    if types:
+        prompt += "\nTYPES THE FILE DEFINES (names only):\n"
+        for name in types:
+            line = f"- {name}\n"
+            if len(prompt) + len(line) > budget:
+                break
+            prompt += line
+    # the other names show what else the file has
+    if names:
+        prompt += "\nEVERYTHING THE FILE DEFINES (names only):\n"
+        for name in names:
+            line = f"- {name}\n"
+            if len(prompt) + len(line) > budget:
+                break
+            prompt += line
+    return prompt
+
+# Build the prompt that asks what one function does. callee_signatures are the declarations of the functions it calls, as background.
+def build_function_documentation_prompt(file_name: str, signature: str, code: str, callee_signatures: list[str]) -> str:
+    budget = get_document_prompt_char_budget(DOCUMENT_FUNCTION_MAX_CHARS)
+    prompt = f"{DOCUMENT_FUNCTION_INSTRUCTION}\nExample of a good answer: {DOCUMENT_FUNCTION_EXAMPLE}\n\nFUNCTION: {signature} (in {file_name})\n"
+    # the background goes after the code, so it is first to be cut when there is no room
+    background = ""
+    if callee_signatures:
+        background = "\nIT CALLS (do not describe these):\n"
+        for signature_line in callee_signatures:
+            background += f"- {signature_line}\n"
+    room_for_code = budget - len(prompt) - len("\nCODE:\n") - 1
+    code_text = fit_code_excerpt(code, room_for_code)
+    prompt += f"\nCODE:\n{code_text}\n"
+    if len(prompt) + len(background) <= budget:
+        prompt += background
+    return prompt
+
+# Build the prompt that asks what a whole project does. notes are one line for each file ("name: what it does").
+def build_repository_overview_prompt(notes: list[str]) -> str:
+    budget = get_document_prompt_char_budget(DOCUMENT_REPOSITORY_MAX_CHARS)
+    prompt = f"{DOCUMENT_REPOSITORY_INSTRUCTION}\nFILES:\n"
+    for note in notes:
+        if len(prompt) + len(note) + DOCUMENT_LIST_LINE_CHARS > budget:
+            break
+        prompt += f"- {note}\n"
+    return prompt
+
+# A grammar that makes the answer one line of text of the allowed length (the model can stop as soon as it has at least the shortest length)
+def build_document_grammar(max_chars: int) -> str:
+    return f"root ::= [^\\n]{{{DOCUMENT_MIN_ANSWER_CHARS},{max_chars}}}\n"
